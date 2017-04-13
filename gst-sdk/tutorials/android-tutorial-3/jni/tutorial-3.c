@@ -141,6 +141,61 @@ static void check_initialization_complete (CustomData *data) {
   }
 }
 
+static gboolean print_field (GQuark field, const GValue * value, gpointer pfx) {
+    gchar *str = gst_value_serialize (value);
+
+    g_print ("%s  %15s: %s\n", (gchar *) pfx, g_quark_to_string (field), str);
+    g_free (str);
+    return TRUE;
+}
+
+static void print_caps (const GstCaps * caps, const gchar * pfx) {
+    guint i;
+
+    g_return_if_fail (caps != NULL);
+
+    if (gst_caps_is_any (caps)) {
+        g_print ("%sANY\n", pfx);
+        return;
+    }
+    if (gst_caps_is_empty (caps)) {
+        g_print ("%sEMPTY\n", pfx);
+        return;
+    }
+
+    for (i = 0; i < gst_caps_get_size (caps); i++) {
+        GstStructure *structure = gst_caps_get_structure (caps, i);
+
+        g_print ("%s%s\n", pfx, gst_structure_get_name (structure));
+        gst_structure_foreach (structure, print_field, (gpointer) pfx);
+    }
+}
+
+
+/* Shows the CURRENT capabilities of the requested pad in the given element */
+static void print_pad_capabilities (GstElement *element, gchar *pad_name) {
+    GstPad *pad = NULL;
+    GstCaps *caps = NULL;
+
+    /* Retrieve pad */
+    pad = gst_element_get_static_pad (element, pad_name);
+    if (!pad) {
+        g_printerr ("Could not retrieve pad '%s'\n", pad_name);
+        return;
+    }
+
+    /* Retrieve negotiated caps (or acceptable caps if negotiation is not finished yet) */
+    caps = gst_pad_get_current_caps (pad);
+    if (!caps)
+        caps = gst_pad_query_caps (pad, NULL);
+
+    /* Print and free */
+    g_print ("Caps for the %s pad:\n", pad_name);
+    print_caps (caps, "      ");
+    gst_caps_unref (caps);
+    gst_object_unref (pad);
+}
+
 /* Main method for the native code. This is executed on its own thread. */
 static void *app_function (void *userdata) {
   JavaVMAttachArgs args;
@@ -148,6 +203,7 @@ static void *app_function (void *userdata) {
   CustomData *data = (CustomData *)userdata;
   GSource *bus_source;
   GError *error = NULL;
+  GstElement  *datasrc, *filter, *conv, *queue, *videosink;
 
   GST_DEBUG ("Creating pipeline in CustomData at %p", data);
 
@@ -156,7 +212,36 @@ static void *app_function (void *userdata) {
   g_main_context_push_thread_default(data->context);
 
   /* Build pipeline */
-  data->pipeline = gst_parse_launch("videotestsrc ! warptv ! videoconvert ! autovideosink", &error);
+  // data->pipeline = gst_parse_launch("videotestsrc ! warptv ! videoconvert ! autovideosink", &error);
+
+  data->pipeline = gst_pipeline_new ("test-pipeline");
+  datasrc = gst_element_factory_make ("videotestsrc", "source");
+  print_pad_capabilities (datasrc, "src");
+  filter = gst_element_factory_make ("capsfilter", "filter");
+  GstCaps *caps = gst_caps_new_simple ("video/x-raw",
+                                         "format", G_TYPE_STRING, "NV12",
+                                         "width", G_TYPE_INT, 320,
+                                         "height", G_TYPE_INT, 240,
+                                         "framerate", GST_TYPE_FRACTION, 30, 1,
+                                         NULL);
+
+  g_object_set(filter, "caps", caps, NULL);
+  gst_caps_unref(caps);
+  print_pad_capabilities (filter, "src");
+
+
+  queue = gst_element_factory_make ("queue", "buffer");
+  conv = gst_element_factory_make ("videoconvert", "converter");
+  videosink = gst_element_factory_make ("autovideosink", "display");
+
+  if (!data->pipeline || !datasrc || !filter || !queue || !conv || !videosink) {
+    g_printerr ("Not all elements could be created.\n");
+    return -1;
+  }
+
+  gst_bin_add_many (GST_BIN (data->pipeline), datasrc, filter, queue, conv, videosink, NULL);
+  gst_element_link_many (datasrc, filter, queue, conv, videosink, NULL);
+
   if (error) {
     gchar *message = g_strdup_printf("Unable to build pipeline: %s", error->message);
     g_clear_error (&error);
@@ -166,7 +251,7 @@ static void *app_function (void *userdata) {
   }
 
   /* Set the pipeline to READY, so it can already accept a window handle, if we have one */
-  gst_element_set_state(data->pipeline, GST_STATE_READY);
+  gst_element_set_state(data->pipeline, GST_STATE_PLAYING);
 
   data->video_sink = gst_bin_get_by_interface(GST_BIN(data->pipeline), GST_TYPE_VIDEO_OVERLAY);
   if (!data->video_sink) {
@@ -328,7 +413,7 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     __android_log_print (ANDROID_LOG_ERROR, "tutorial-3", "Could not retrieve JNIEnv");
     return 0;
   }
-  jclass klass = (*env)->FindClass (env, "org/freedesktop/gstreamer/tutorials/tutorial_3/Tutorial3");
+  jclass klass = (*env)->FindClass (env, "org/freedesktop/gstreamer/tutorial_3/Tutorial3");
   (*env)->RegisterNatives (env, klass, native_methods, G_N_ELEMENTS(native_methods));
 
   pthread_key_create (&current_jni_env, detach_current_thread);
